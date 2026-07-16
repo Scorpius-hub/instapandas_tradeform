@@ -2,11 +2,12 @@
 /**
  * Plugin Name: InstaPandas TradeForm
  * Description: 可自由添加/编辑字段的留言表单，提交后立即返回成功，邮件通知在后台异步发送。后台提交记录支持国家/浏览器/来源识别与未读角标提醒。
- * Version: 2.5.4
+ * Version: 2.5.5
  * Author: Alec.Feng
  * Text Domain: instapandas-tradeform
  *
  * 更新日志：
+ * 2.5.5 - 后台菜单未读角标改为蓝色（#0066cc），并修复菜单文字较长时角标被挤到第二行的问题
  * 2.5.4 - 更新诊断工具改为在设置页原地显示结果（AJAX），不再跳出新页面
  * 2.5.3 - 新增"插件自动更新诊断"工具（在 reCAPTCHA 设置页），一键实时检查服务器是否能
  *         连上 GitHub API、返回了什么，方便排查更新提示不出现的具体原因
@@ -1395,7 +1396,20 @@ class Custom_Inquiry_Form_V2 {
         if ( $count <= 0 ) {
             return '';
         }
-        return ' <span class="cif-unread-badge" style="display:inline-block;min-width:18px;height:18px;line-height:18px;padding:0 5px;border-radius:9px;background:#d63638;color:#fff;font-size:11px;text-align:center;margin-left:4px;">' . intval( $count ) . '</span>';
+        // white-space:nowrap 包住整块，避免菜单文字比较长时数字被挤到第二行
+        return ' <span class="cif-unread-badge" style="display:inline-block;min-width:16px;height:16px;line-height:16px;padding:0 4px;border-radius:8px;background:#0066cc;color:#fff;font-size:10px;text-align:center;margin-left:3px;vertical-align:middle;white-space:nowrap;">' . intval( $count ) . '</span>';
+    }
+
+    /**
+     * 把菜单文字和角标包在一起，整体设置 white-space:nowrap，
+     * 这样角标数字不会因为文字宽度不够而被挤到下一行
+     */
+    private function menu_label_with_badge( $label, $count ) {
+        $badge = $this->menu_badge_html( $count );
+        if ( '' === $badge ) {
+            return $label;
+        }
+        return '<span style="white-space:nowrap;">' . $label . $badge . '</span>';
     }
 
     public function register_admin_menu() {
@@ -1403,7 +1417,7 @@ class Custom_Inquiry_Form_V2 {
 
         add_menu_page(
             '询盘表单',
-            '询盘表单' . $this->menu_badge_html( $unread ),
+            $this->menu_label_with_badge( '询盘表单', $unread ),
             'manage_options',
             'custom-inquiry-form',
             array( $this, 'render_submissions_page' ),
@@ -1411,7 +1425,7 @@ class Custom_Inquiry_Form_V2 {
             26
         );
 
-        add_submenu_page( 'custom-inquiry-form', '提交记录', '提交记录' . $this->menu_badge_html( $unread ), 'manage_options', 'custom-inquiry-form', array( $this, 'render_submissions_page' ) );
+        add_submenu_page( 'custom-inquiry-form', '提交记录', $this->menu_label_with_badge( '提交记录', $unread ), 'manage_options', 'custom-inquiry-form', array( $this, 'render_submissions_page' ) );
         add_submenu_page( 'custom-inquiry-form', '字段管理', '字段管理', 'manage_options', 'custom-inquiry-form-fields', array( $this, 'render_fields_page' ) );
         add_submenu_page( 'custom-inquiry-form', '黑名单', '黑名单', 'manage_options', 'custom-inquiry-form-blacklist', array( $this, 'render_blacklist_page' ) );
         add_submenu_page( 'custom-inquiry-form', 'reCAPTCHA设置', 'reCAPTCHA设置', 'manage_options', 'custom-inquiry-form-recaptcha', array( $this, 'render_recaptcha_page' ) );
@@ -1456,12 +1470,16 @@ class Custom_Inquiry_Form_V2 {
                     if ( href.indexOf( 'page=custom-inquiry-form-' ) !== -1 ) {
                         return;
                     }
+                    // 每次都顺手把菜单链接设成 nowrap，保证角标（不管是页面初次渲染的，
+                    // 还是这里 JS 动态加回来的）都不会被挤到第二行
+                    link.style.whiteSpace = 'nowrap';
+
                     var badge = link.querySelector('.cif-unread-badge');
                     if (count > 0) {
                         if (!badge) {
                             badge = document.createElement('span');
                             badge.className = 'cif-unread-badge';
-                            badge.style.cssText = 'display:inline-block;min-width:18px;height:18px;line-height:18px;padding:0 5px;border-radius:9px;background:#d63638;color:#fff;font-size:11px;text-align:center;margin-left:4px;';
+                            badge.style.cssText = 'display:inline-block;min-width:16px;height:16px;line-height:16px;padding:0 4px;border-radius:8px;background:#0066cc;color:#fff;font-size:10px;text-align:center;margin-left:3px;vertical-align:middle;white-space:nowrap;';
                             link.appendChild(badge);
                         }
                         badge.textContent = count;
