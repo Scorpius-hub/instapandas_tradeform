@@ -2,11 +2,18 @@
 /**
  * Plugin Name: InstaPandas TradeForm
  * Description: 可自由添加/编辑字段的留言表单，提交后立即返回成功，邮件通知在后台异步发送。后台提交记录支持国家/浏览器/来源识别与未读角标提醒。
- * Version: 2.5.0
+ * Version: 2.5.2
  * Author: Alec.Feng
  * Text Domain: instapandas-tradeform
  *
  * 更新日志：
+ * 2.5.2 - reCAPTCHA v2 改为 explicit render（手动渲染 + 记录 widget id），
+ *         不再使用通用的 .g-recaptcha class，解决与站内其它脚本（主题/其它插件）
+ *         抢着渲染同一个元素导致 "reCAPTCHA has already been rendered" 报错、
+ *         勾选框提交后无法重置的问题
+ * 2.5.1 - 修复 reCAPTCHA v2 提交后偶发无法重置勾选框、需刷新页面才能再次提交的问题；
+ *         新增基于 GitHub Releases 的自动更新检查，插件更新后在 WordPress 后台
+ *         "插件"页面即可直接点击更新，无需再手动上传覆盖
  * 2.5.0 - 新增 Google reCAPTCHA 验证：支持 v2（勾选框）和 v3（无感知评分）两种版本，
  *         在"reCAPTCHA设置"页填入 Site Key / Secret Key 后自动在表单里启用，
  *         提交时后台会向 Google 校验，未通过则拒绝提交；不填写密钥则不启用，不影响原有功能
@@ -40,6 +47,10 @@ class Custom_Inquiry_Form_V2 {
     const DB_VERSION_OPTION = 'cif_db_version';
     const DB_VERSION        = '2.5.0';
     const ADMIN_AJAX_NONCE  = 'cif_admin_ajax';
+
+    // 用于自动更新检查的 GitHub 仓库（owner/repo），仓库需为 Public，
+    // 每次发布新版本时打一个 tag（如 v2.5.1）并上传打包好的插件 zip 作为 Release 附件
+    const GITHUB_REPO = 'Scorpius-hub/instapandas_tradeform';
 
     private $supported_types = array(
         'text'     => '单行文本',
@@ -77,6 +88,193 @@ class Custom_Inquiry_Form_V2 {
         add_action( 'wp_ajax_cif_toggle_status', array( $this, 'ajax_toggle_status' ) );
         add_action( 'wp_ajax_cif_mark_all_read', array( $this, 'ajax_mark_all_read' ) );
         add_action( 'wp_ajax_cif_get_submissions_html', array( $this, 'ajax_get_submissions_html' ) );
+
+        // GitHub Releases 自动更新检查
+        add_filter( 'pre_set_site_transient_update_plugins', array( $this, 'check_for_update' ) );
+        add_filter( 'plugins_api', array( $this, 'plugins_api_info' ), 10, 3 );
+        add_filter( 'upgrader_source_selection', array( $this, 'fix_update_source_dir' ), 10, 4 );
+        add_action( 'upgrader_process_complete', array( $this, 'purge_update_cache' ), 10, 2 );
+    }
+
+    /* ---------------------- GitHub Releases 自动更新 ---------------------- */
+
+    /**
+     * 当前插件文件的 Version 头信息，直接读取文件头注释，避免和常量重复维护出现不一致
+     */
+    private function get_current_version() {
+        if ( ! function_exists( 'get_file_data' ) ) {
+            require_once ABSPATH . WPINC . '/functions.php';
+        }
+        $data = get_file_data( __FILE__, array( 'Version' => 'Version' ) );
+        return isset( $data['Version'] ) ? $data['Version'] : '0.0.0';
+    }
+
+    /**
+     * 拉取 GitHub 最新 Release 信息，12 小时缓存一次，避免频繁请求 GitHub API 被限流
+     * 返回 false 表示暂时取不到（网络问题 / 还没发布过 Release），version/package/notes 为具体信息
+     */
+    private function get_github_release_info() {
+        $cache_key = 'cif_github_release_info';
+        $cached    = get_transient( $cache_key );
+        if ( false !== $cached ) {
+            return $cached ? $cached : false;
+        }
+
+        $response = wp_remote_get(
+            'https://api.github.com/repos/' . self::GITHUB_REPO . '/releases/latest',
+            array(
+                'timeout' => 8,
+                'headers' => array(
+                    'Accept'     => 'application/vnd.github+json',
+                    // GitHub API 要求必须带 User-Agent，否则会被拒绝
+                    'User-Agent' => 'InstaPandas-TradeForm-Updater',
+                ),
+            )
+        );
+
+        if ( is_wp_error( $response ) || 200 !== wp_remote_retrieve_response_code( $response ) ) {
+            // 取失败先短暂缓存空结果，避免每次加载插件页面都重新请求
+            set_transient( $cache_key, '', 5 * MINUTE_IN_SECONDS );
+            return false;
+        }
+
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( empty( $body['tag_name'] ) ) {
+            set_transient( $cache_key, '', 5 * MINUTE_IN_SECONDS );
+            return false;
+        }
+
+        // tag 一般是 v2.5.1 这种格式，去掉开头的 v 得到纯版本号
+        $version = ltrim( $body['tag_name'], 'vV' );
+
+        // 优先用 Release 里手动上传的 zip 附件（文件夹名已经是正确的插件目录名）；
+        // 如果没有附件，退回用 GitHub 自动生成的源码包（文件夹名会带仓库名+commit，需要靠
+        // fix_update_source_dir() 再纠正一次）
+        $package = '';
+        if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
+            foreach ( $body['assets'] as $asset ) {
+                if ( ! empty( $asset['browser_download_url'] ) && preg_match( '/\.zip$/i', $asset['name'] ) ) {
+                    $package = $asset['browser_download_url'];
+                    break;
+                }
+            }
+        }
+        if ( '' === $package && ! empty( $body['zipball_url'] ) ) {
+            $package = $body['zipball_url'];
+        }
+
+        $info = array(
+            'version' => $version,
+            'package' => $package,
+            'notes'   => isset( $body['body'] ) ? $body['body'] : '',
+            'url'     => isset( $body['html_url'] ) ? $body['html_url'] : ( 'https://github.com/' . self::GITHUB_REPO ),
+        );
+
+        set_transient( $cache_key, $info, 12 * HOUR_IN_SECONDS );
+        return $info;
+    }
+
+    /**
+     * 挂在 pre_set_site_transient_update_plugins，把 GitHub 上更新的版本信息塞进 WP 的更新检查结果里，
+     * 这样后台"插件"页面就会正常显示"有可用更新"，点更新按钮走 WP 原生升级流程
+     */
+    public function check_for_update( $transient ) {
+        if ( empty( $transient ) || ! is_object( $transient ) ) {
+            return $transient;
+        }
+
+        $remote = $this->get_github_release_info();
+        if ( ! $remote || empty( $remote['package'] ) ) {
+            return $transient;
+        }
+
+        $current_version = $this->get_current_version();
+        if ( ! version_compare( $remote['version'], $current_version, '>' ) ) {
+            return $transient;
+        }
+
+        $plugin_file = plugin_basename( __FILE__ );
+
+        $item              = new stdClass();
+        $item->slug        = dirname( $plugin_file );
+        $item->plugin      = $plugin_file;
+        $item->new_version = $remote['version'];
+        $item->url         = $remote['url'];
+        $item->package     = $remote['package'];
+        $item->tested      = get_bloginfo( 'version' );
+
+        if ( ! isset( $transient->response ) || ! is_array( $transient->response ) ) {
+            $transient->response = array();
+        }
+        $transient->response[ $plugin_file ] = $item;
+
+        return $transient;
+    }
+
+    /**
+     * 插件列表页点"查看详情"弹窗时显示的信息（版本号、更新说明），非必需但体验更完整
+     */
+    public function plugins_api_info( $result, $action, $args ) {
+        if ( 'plugin_information' !== $action || empty( $args->slug ) || dirname( plugin_basename( __FILE__ ) ) !== $args->slug ) {
+            return $result;
+        }
+
+        $remote = $this->get_github_release_info();
+        if ( ! $remote ) {
+            return $result;
+        }
+
+        $info                 = new stdClass();
+        $info->name           = 'InstaPandas TradeForm';
+        $info->slug           = $args->slug;
+        $info->version        = $remote['version'];
+        $info->author         = 'Alec.Feng';
+        $info->homepage       = $remote['url'];
+        $info->sections       = array(
+            'description' => '可自由添加/编辑字段的留言表单插件。',
+            'changelog'   => wpautop( wp_kses_post( $remote['notes'] ) ),
+        );
+        $info->download_link  = $remote['package'];
+
+        return $info;
+    }
+
+    /**
+     * 如果更新包用的是 GitHub 自动生成的源码压缩包（zipball），解压后文件夹名会是
+     * "仓库名-commit哈希" 这种格式，跟原来已安装的插件目录名对不上，WordPress 会把它
+     * 当成一个新插件装进去，导致设置丢失、重复插件。这里统一把解压出来的文件夹改名成
+     * 跟当前插件目录一致，保证是"原地更新"而不是"新装一个"。
+     * 如果 Release 里传的是手动打包好的、文件夹名本来就正确的 zip，这一步不会有影响。
+     */
+    public function fix_update_source_dir( $source, $remote_source, $upgrader, $hook_extra = array() ) {
+        global $wp_filesystem;
+
+        if ( empty( $hook_extra['plugin'] ) || plugin_basename( __FILE__ ) !== $hook_extra['plugin'] ) {
+            return $source;
+        }
+
+        $desired_slug = dirname( plugin_basename( __FILE__ ) );
+        $current_name = basename( untrailingslashit( $source ) );
+
+        if ( $current_name === $desired_slug || ! $wp_filesystem ) {
+            return $source;
+        }
+
+        $new_source = trailingslashit( $remote_source ) . $desired_slug . '/';
+
+        if ( $wp_filesystem->move( $source, $new_source ) ) {
+            return $new_source;
+        }
+
+        return $source;
+    }
+
+    /**
+     * 更新完成后清掉缓存的 Release 信息，下次进插件页面会重新拉取最新数据，
+     * 避免刚更新完还提示"有新版本"（用的是更新前缓存的旧判断结果）
+     */
+    public function purge_update_cache( $upgrader, $hook_extra ) {
+        delete_transient( 'cif_github_release_info' );
     }
 
     /**
@@ -573,9 +771,12 @@ class Custom_Inquiry_Form_V2 {
         $recaptcha_active = $this->is_recaptcha_active();
 
         if ( $recaptcha_active ) {
+            // v2 改用 explicit render（onload=cifRecaptchaOnload&render=explicit），
+            // 由我们自己的回调手动渲染 widget，不再依赖 Google 默认的"自动扫描全页面 .g-recaptcha"，
+            // 避免跟站内其它脚本产生渲染冲突（见 cifRecaptchaOnload 的说明）
             $api_src = 'v3' === $recaptcha['version']
                 ? 'https://www.google.com/recaptcha/api.js?render=' . rawurlencode( $recaptcha['site_key'] )
-                : 'https://www.google.com/recaptcha/api.js';
+                : 'https://www.google.com/recaptcha/api.js?onload=cifRecaptchaOnload&render=explicit';
             wp_register_script( 'cif-recaptcha-api', $api_src, array(), null, true );
             wp_enqueue_script( 'cif-recaptcha-api' );
         }
@@ -628,7 +829,12 @@ class Custom_Inquiry_Form_V2 {
                     <?php $rc = $this->get_recaptcha_settings(); ?>
                     <?php if ( 'v2' === $rc['version'] ) : ?>
                         <div class="cif-field cif-recaptcha-field">
-                            <div class="g-recaptcha" data-sitekey="<?php echo esc_attr( $rc['site_key'] ); ?>"></div>
+                            <!-- 注意：这里故意不用通用的 "g-recaptcha" class，改用插件自己独有的 class + id，
+                                 并且用 explicit render（见下方 JS 的 cifRecaptchaOnload）手动渲染、
+                                 自己记录 widget id。避免网站上其它脚本（主题/其它插件）也在扫描通用的
+                                 .g-recaptcha 元素时抢着渲染，导致 "reCAPTCHA has already been rendered"
+                                 报错、widget 状态混乱、重置失效的问题 -->
+                            <div class="cif-g-recaptcha" id="cif-recaptcha-widget" data-sitekey="<?php echo esc_attr( $rc['site_key'] ); ?>"></div>
                         </div>
                     <?php else : ?>
                         <input type="hidden" name="cif_recaptcha_token" class="cif-recaptcha-token" value="" />
@@ -749,6 +955,27 @@ class Custom_Inquiry_Form_V2 {
 
     private function get_inline_js() {
         return <<<'JS'
+        // v2 用 explicit render：Google 的 recaptcha 脚本加载完成后，会自己调用这个全局函数
+        // （脚本 URL 里带的 onload=cifRecaptchaOnload 参数指定的就是它）。
+        // 我们在这里手动渲染 widget，并把返回的 widget id 记下来，reset 的时候精确指定这个 id，
+        // 不会跟页面上其它脚本（比如主题或别的插件也监听 .g-recaptcha）互相干扰。
+        window.cifRecaptchaWidgetId = null;
+        window.cifRecaptchaOnload = function () {
+            var el = document.getElementById('cif-recaptcha-widget');
+            if (!el || typeof grecaptcha === 'undefined' || typeof grecaptcha.render !== 'function') {
+                return;
+            }
+            try {
+                window.cifRecaptchaWidgetId = grecaptcha.render(el, {
+                    sitekey: el.getAttribute('data-sitekey')
+                });
+            } catch (err) {
+                if (window.console && console.error) {
+                    console.error('[cif] grecaptcha.render() 失败:', err);
+                }
+            }
+        };
+
         document.addEventListener('DOMContentLoaded', function () {
             var form = document.getElementById('cif-inquiry-form');
             if (!form) return;
@@ -767,7 +994,11 @@ class Custom_Inquiry_Form_V2 {
                 // 所以单独包一层 try/catch，并且放在最前面第一件事就做。
                 try {
                     if (recaptcha.active && recaptcha.version === 'v2' && typeof grecaptcha !== 'undefined' && typeof grecaptcha.reset === 'function') {
-                        grecaptcha.reset();
+                        if (window.cifRecaptchaWidgetId !== null) {
+                            grecaptcha.reset(window.cifRecaptchaWidgetId);
+                        } else {
+                            grecaptcha.reset();
+                        }
                     }
                 } catch (err) {
                     if (window.console && console.error) {
