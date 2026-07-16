@@ -2,11 +2,12 @@
 /**
  * Plugin Name: InstaPandas TradeForm
  * Description: 可自由添加/编辑字段的留言表单，提交后立即返回成功，邮件通知在后台异步发送。后台提交记录支持国家/浏览器/来源识别与未读角标提醒。
- * Version: 2.5.3
+ * Version: 2.5.4
  * Author: Alec.Feng
  * Text Domain: instapandas-tradeform
  *
  * 更新日志：
+ * 2.5.4 - 更新诊断工具改为在设置页原地显示结果（AJAX），不再跳出新页面
  * 2.5.3 - 新增"插件自动更新诊断"工具（在 reCAPTCHA 设置页），一键实时检查服务器是否能
  *         连上 GitHub API、返回了什么，方便排查更新提示不出现的具体原因
  * 2.5.2 - reCAPTCHA v2 改为 explicit render（手动渲染 + 记录 widget id），
@@ -97,6 +98,7 @@ class Custom_Inquiry_Form_V2 {
         add_filter( 'upgrader_source_selection', array( $this, 'fix_update_source_dir' ), 10, 4 );
         add_action( 'upgrader_process_complete', array( $this, 'purge_update_cache' ), 10, 2 );
         add_action( 'admin_post_cif_debug_update_check', array( $this, 'handle_debug_update_check' ) );
+        add_action( 'wp_ajax_cif_debug_update_check', array( $this, 'ajax_debug_update_check' ) );
     }
 
     /* ---------------------- GitHub Releases 自动更新 ---------------------- */
@@ -291,6 +293,29 @@ class Custom_Inquiry_Form_V2 {
         }
         check_admin_referer( 'cif_debug_update_check' );
 
+        echo '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;max-width:800px;margin:40px auto;line-height:1.8;">';
+        echo $this->build_update_diagnostic_html();
+        echo '<p><a href="' . esc_url( admin_url( 'admin.php?page=custom-inquiry-form-recaptcha' ) ) . '">&larr; 返回设置页</a></p>';
+        echo '</div>';
+        exit;
+    }
+
+    /**
+     * 供设置页里的按钮通过 AJAX 调用，结果直接原地显示在设置页下方，不用跳出新页面
+     */
+    public function ajax_debug_update_check() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_send_json_error( array( 'message' => '权限不足' ) );
+        }
+        check_ajax_referer( self::ADMIN_AJAX_NONCE, 'nonce' );
+
+        wp_send_json_success( array( 'html' => $this->build_update_diagnostic_html() ) );
+    }
+
+    /**
+     * 实际执行诊断请求、拼出结果 HTML 片段（不含外层容器），两个入口共用这一份逻辑
+     */
+    private function build_update_diagnostic_html() {
         delete_transient( 'cif_github_release_info' );
 
         $current_version = $this->get_current_version();
@@ -306,37 +331,36 @@ class Custom_Inquiry_Form_V2 {
             )
         );
 
-        echo '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;max-width:800px;margin:40px auto;line-height:1.8;">';
-        echo '<h2>InstaPandas TradeForm — 更新检查诊断</h2>';
-        echo '<p><strong>当前插件版本：</strong>' . esc_html( $current_version ) . '</p>';
-        echo '<p><strong>检查地址：</strong>https://api.github.com/repos/' . esc_html( self::GITHUB_REPO ) . '/releases/latest</p>';
+        $html  = '<h3 style="margin-top:0;">检查结果</h3>';
+        $html .= '<p><strong>当前插件版本：</strong>' . esc_html( $current_version ) . '</p>';
+        $html .= '<p><strong>检查地址：</strong>https://api.github.com/repos/' . esc_html( self::GITHUB_REPO ) . '/releases/latest</p>';
 
         if ( is_wp_error( $response ) ) {
-            echo '<p style="color:#b31212;"><strong>请求失败——服务器连不上 GitHub：</strong></p>';
-            echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;white-space:pre-wrap;">' . esc_html( $response->get_error_message() ) . '</pre>';
-            echo '<p>这种情况通常是服务器所在机房无法访问 GitHub（不少大陆服务器都有这个限制）。可以联系主机服务商确认服务器能不能访问 https://api.github.com ，或者考虑让服务器走一个可用的出站代理。</p>';
+            $html .= '<p style="color:#b31212;"><strong>请求失败——服务器连不上 GitHub：</strong></p>';
+            $html .= '<pre style="background:#fdeaea;padding:12px;border-radius:4px;white-space:pre-wrap;">' . esc_html( $response->get_error_message() ) . '</pre>';
+            $html .= '<p>这种情况通常是服务器所在机房无法访问 GitHub（不少大陆服务器都有这个限制）。可以联系主机服务商确认服务器能不能访问 https://api.github.com ，或者考虑让服务器走一个可用的出站代理。</p>';
         } else {
             $code     = wp_remote_retrieve_response_code( $response );
             $body_raw = wp_remote_retrieve_body( $response );
 
-            echo '<p><strong>HTTP 状态码：</strong>' . esc_html( $code ) . '</p>';
+            $html .= '<p><strong>HTTP 状态码：</strong>' . esc_html( $code ) . '</p>';
 
             if ( 200 !== (int) $code ) {
-                echo '<p style="color:#b31212;"><strong>GitHub 返回了非正常状态码，原始返回内容：</strong></p>';
-                echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
+                $html .= '<p style="color:#b31212;"><strong>GitHub 返回了非正常状态码，原始返回内容：</strong></p>';
+                $html .= '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
             } else {
                 $body = json_decode( $body_raw, true );
 
                 if ( empty( $body['tag_name'] ) ) {
-                    echo '<p style="color:#b31212;"><strong>请求成功，但没有解析到版本号（可能仓库还没发布任何 Release，或仓库不是 Public）：</strong></p>';
-                    echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
+                    $html .= '<p style="color:#b31212;"><strong>请求成功，但没有解析到版本号（可能仓库还没发布任何 Release，或仓库不是 Public）：</strong></p>';
+                    $html .= '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
                 } else {
                     $remote_version = ltrim( $body['tag_name'], 'vV' );
                     $has_update     = version_compare( $remote_version, $current_version, '>' );
 
-                    echo '<p style="color:#1e7e34;"><strong>请求成功！</strong></p>';
-                    echo '<p><strong>GitHub 上最新版本：</strong>' . esc_html( $remote_version ) . '</p>';
-                    echo '<p><strong>是否判定为有更新：</strong>' . ( $has_update
+                    $html .= '<p style="color:#1e7e34;"><strong>请求成功！</strong></p>';
+                    $html .= '<p><strong>GitHub 上最新版本：</strong>' . esc_html( $remote_version ) . '</p>';
+                    $html .= '<p><strong>是否判定为有更新：</strong>' . ( $has_update
                         ? '<span style="color:#1e7e34;">是，插件页面应该会出现更新提示</span>'
                         : '<span style="color:#b31212;">否（GitHub 上的版本号没有比当前已安装版本更高，正常现象，不算错误）</span>' ) . '</p>';
 
@@ -344,22 +368,20 @@ class Custom_Inquiry_Form_V2 {
                     if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
                         foreach ( $body['assets'] as $asset ) {
                             if ( ! empty( $asset['browser_download_url'] ) && preg_match( '/\.zip$/i', $asset['name'] ) ) {
-                                echo '<p><strong>找到的 zip 附件：</strong>' . esc_html( $asset['name'] ) . '</p>';
+                                $html       .= '<p><strong>找到的 zip 附件：</strong>' . esc_html( $asset['name'] ) . '</p>';
                                 $asset_found = true;
                                 break;
                             }
                         }
                     }
                     if ( ! $asset_found ) {
-                        echo '<p style="color:#b31212;">没有在 Release 里找到 .zip 格式的附件——发布 Release 时记得把打包好的 zip 拖进 Assets 区域上传。</p>';
+                        $html .= '<p style="color:#b31212;">没有在 Release 里找到 .zip 格式的附件——发布 Release 时记得把打包好的 zip 拖进 Assets 区域上传。</p>';
                     }
                 }
             }
         }
 
-        echo '<p><a href="' . esc_url( admin_url( 'admin.php?page=custom-inquiry-form-recaptcha' ) ) . '">&larr; 返回设置页</a></p>';
-        echo '</div>';
-        exit;
+        return $html;
     }
 
     /**
@@ -1865,11 +1887,43 @@ class Custom_Inquiry_Form_V2 {
             <hr />
             <h2>插件自动更新诊断</h2>
             <p class="description">如果后台迟迟不出现"有新版本"的提示，点这个按钮直接实时检查一次服务器能不能连上 GitHub、返回了什么，方便判断具体卡在哪一步。</p>
-            <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" target="_blank">
-                <input type="hidden" name="action" value="cif_debug_update_check" />
-                <?php wp_nonce_field( 'cif_debug_update_check' ); ?>
-                <?php submit_button( '立即检查 GitHub 更新连通性', 'secondary' ); ?>
-            </form>
+            <button type="button" class="button button-secondary" id="cif-update-diagnostic-btn">立即检查 GitHub 更新连通性</button>
+            <div id="cif-update-diagnostic-result" style="margin-top:16px;max-width:800px;"></div>
+            <script>
+            (function () {
+                var btn = document.getElementById('cif-update-diagnostic-btn');
+                var resultBox = document.getElementById('cif-update-diagnostic-result');
+                if (!btn || typeof CIF_ADMIN === 'undefined') { return; }
+
+                btn.addEventListener('click', function () {
+                    btn.disabled = true;
+                    var originalText = btn.textContent;
+                    btn.textContent = '检查中…';
+                    resultBox.innerHTML = '';
+
+                    var formData = new FormData();
+                    formData.append('action', 'cif_debug_update_check');
+                    formData.append('nonce', CIF_ADMIN.nonce);
+
+                    fetch(CIF_ADMIN.ajax_url, { method: 'POST', body: formData, credentials: 'same-origin' })
+                        .then(function (res) { return res.json(); })
+                        .then(function (data) {
+                            btn.disabled = false;
+                            btn.textContent = originalText;
+                            if (data && data.success) {
+                                resultBox.innerHTML = data.data.html;
+                            } else {
+                                resultBox.innerHTML = '<p style="color:#b31212;">检查失败：' + ((data && data.data && data.data.message) || '未知错误') + '</p>';
+                            }
+                        })
+                        .catch(function () {
+                            btn.disabled = false;
+                            btn.textContent = originalText;
+                            resultBox.innerHTML = '<p style="color:#b31212;">请求出错，请重试。</p>';
+                        });
+                });
+            })();
+            </script>
         </div>
         <?php
     }
