@@ -2,11 +2,13 @@
 /**
  * Plugin Name: InstaPandas TradeForm
  * Description: 可自由添加/编辑字段的留言表单，提交后立即返回成功，邮件通知在后台异步发送。后台提交记录支持国家/浏览器/来源识别与未读角标提醒。
- * Version: 2.5.2
+ * Version: 2.5.3
  * Author: Alec.Feng
  * Text Domain: instapandas-tradeform
  *
  * 更新日志：
+ * 2.5.3 - 新增"插件自动更新诊断"工具（在 reCAPTCHA 设置页），一键实时检查服务器是否能
+ *         连上 GitHub API、返回了什么，方便排查更新提示不出现的具体原因
  * 2.5.2 - reCAPTCHA v2 改为 explicit render（手动渲染 + 记录 widget id），
  *         不再使用通用的 .g-recaptcha class，解决与站内其它脚本（主题/其它插件）
  *         抢着渲染同一个元素导致 "reCAPTCHA has already been rendered" 报错、
@@ -94,6 +96,7 @@ class Custom_Inquiry_Form_V2 {
         add_filter( 'plugins_api', array( $this, 'plugins_api_info' ), 10, 3 );
         add_filter( 'upgrader_source_selection', array( $this, 'fix_update_source_dir' ), 10, 4 );
         add_action( 'upgrader_process_complete', array( $this, 'purge_update_cache' ), 10, 2 );
+        add_action( 'admin_post_cif_debug_update_check', array( $this, 'handle_debug_update_check' ) );
     }
 
     /* ---------------------- GitHub Releases 自动更新 ---------------------- */
@@ -275,6 +278,88 @@ class Custom_Inquiry_Form_V2 {
      */
     public function purge_update_cache( $upgrader, $hook_extra ) {
         delete_transient( 'cif_github_release_info' );
+    }
+
+    /**
+     * 后台一键诊断：跳过缓存，实时真实请求一次 GitHub API，把结果原样展示出来，
+     * 方便判断"到底是服务器连不上 GitHub" / "仓库没发布 Release" / "版本号没比当前的高"
+     * / "Release 里没传 zip 附件" 中的哪一种情况，不用去查服务器日志。
+     */
+    public function handle_debug_update_check() {
+        if ( ! current_user_can( 'manage_options' ) ) {
+            wp_die( '权限不足' );
+        }
+        check_admin_referer( 'cif_debug_update_check' );
+
+        delete_transient( 'cif_github_release_info' );
+
+        $current_version = $this->get_current_version();
+
+        $response = wp_remote_get(
+            'https://api.github.com/repos/' . self::GITHUB_REPO . '/releases/latest',
+            array(
+                'timeout' => 10,
+                'headers' => array(
+                    'Accept'     => 'application/vnd.github+json',
+                    'User-Agent' => 'InstaPandas-TradeForm-Updater',
+                ),
+            )
+        );
+
+        echo '<div style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',sans-serif;max-width:800px;margin:40px auto;line-height:1.8;">';
+        echo '<h2>InstaPandas TradeForm — 更新检查诊断</h2>';
+        echo '<p><strong>当前插件版本：</strong>' . esc_html( $current_version ) . '</p>';
+        echo '<p><strong>检查地址：</strong>https://api.github.com/repos/' . esc_html( self::GITHUB_REPO ) . '/releases/latest</p>';
+
+        if ( is_wp_error( $response ) ) {
+            echo '<p style="color:#b31212;"><strong>请求失败——服务器连不上 GitHub：</strong></p>';
+            echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;white-space:pre-wrap;">' . esc_html( $response->get_error_message() ) . '</pre>';
+            echo '<p>这种情况通常是服务器所在机房无法访问 GitHub（不少大陆服务器都有这个限制）。可以联系主机服务商确认服务器能不能访问 https://api.github.com ，或者考虑让服务器走一个可用的出站代理。</p>';
+        } else {
+            $code     = wp_remote_retrieve_response_code( $response );
+            $body_raw = wp_remote_retrieve_body( $response );
+
+            echo '<p><strong>HTTP 状态码：</strong>' . esc_html( $code ) . '</p>';
+
+            if ( 200 !== (int) $code ) {
+                echo '<p style="color:#b31212;"><strong>GitHub 返回了非正常状态码，原始返回内容：</strong></p>';
+                echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
+            } else {
+                $body = json_decode( $body_raw, true );
+
+                if ( empty( $body['tag_name'] ) ) {
+                    echo '<p style="color:#b31212;"><strong>请求成功，但没有解析到版本号（可能仓库还没发布任何 Release，或仓库不是 Public）：</strong></p>';
+                    echo '<pre style="background:#fdeaea;padding:12px;border-radius:4px;max-height:300px;overflow:auto;white-space:pre-wrap;">' . esc_html( $body_raw ) . '</pre>';
+                } else {
+                    $remote_version = ltrim( $body['tag_name'], 'vV' );
+                    $has_update     = version_compare( $remote_version, $current_version, '>' );
+
+                    echo '<p style="color:#1e7e34;"><strong>请求成功！</strong></p>';
+                    echo '<p><strong>GitHub 上最新版本：</strong>' . esc_html( $remote_version ) . '</p>';
+                    echo '<p><strong>是否判定为有更新：</strong>' . ( $has_update
+                        ? '<span style="color:#1e7e34;">是，插件页面应该会出现更新提示</span>'
+                        : '<span style="color:#b31212;">否（GitHub 上的版本号没有比当前已安装版本更高，正常现象，不算错误）</span>' ) . '</p>';
+
+                    $asset_found = false;
+                    if ( ! empty( $body['assets'] ) && is_array( $body['assets'] ) ) {
+                        foreach ( $body['assets'] as $asset ) {
+                            if ( ! empty( $asset['browser_download_url'] ) && preg_match( '/\.zip$/i', $asset['name'] ) ) {
+                                echo '<p><strong>找到的 zip 附件：</strong>' . esc_html( $asset['name'] ) . '</p>';
+                                $asset_found = true;
+                                break;
+                            }
+                        }
+                    }
+                    if ( ! $asset_found ) {
+                        echo '<p style="color:#b31212;">没有在 Release 里找到 .zip 格式的附件——发布 Release 时记得把打包好的 zip 拖进 Assets 区域上传。</p>';
+                    }
+                }
+            }
+        }
+
+        echo '<p><a href="' . esc_url( admin_url( 'admin.php?page=custom-inquiry-form-recaptcha' ) ) . '">&larr; 返回设置页</a></p>';
+        echo '</div>';
+        exit;
     }
 
     /**
@@ -1775,6 +1860,15 @@ class Custom_Inquiry_Form_V2 {
                     </tr>
                 </table>
                 <?php submit_button( '保存 reCAPTCHA 设置' ); ?>
+            </form>
+
+            <hr />
+            <h2>插件自动更新诊断</h2>
+            <p class="description">如果后台迟迟不出现"有新版本"的提示，点这个按钮直接实时检查一次服务器能不能连上 GitHub、返回了什么，方便判断具体卡在哪一步。</p>
+            <form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" target="_blank">
+                <input type="hidden" name="action" value="cif_debug_update_check" />
+                <?php wp_nonce_field( 'cif_debug_update_check' ); ?>
+                <?php submit_button( '立即检查 GitHub 更新连通性', 'secondary' ); ?>
             </form>
         </div>
         <?php
